@@ -10032,6 +10032,31 @@ int gpioWaveTxAt(void)
 
 /* ----------------------------------------------------------------------- */
 
+int gpioWaveTxCbPos(void) {
+   int i, cb;
+
+   DBG(DBG_USER, "");
+
+   CHECK_INITED;
+
+   cb = dmaNowAtOCB();
+
+   if (cb < 0) return cb;
+
+   for (i=0; i<PI_MAX_WAVES; i++)
+   {
+      if ( !waveInfo[i].deleted &&
+          (cb >= waveInfo[i].botCB) &&
+          (cb <= waveInfo[i].topCB) ) {
+         return cb - waveInfo[i].botCB;
+      }
+   }
+
+   return -PI_WAVE_NOT_FOUND;
+}
+
+/* ----------------------------------------------------------------------- */
+
 int gpioWaveTxStop(void)
 {
    DBG(DBG_USER, "");

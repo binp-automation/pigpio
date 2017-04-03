@@ -2037,6 +2037,19 @@ D*/
 
 
 /*F*/
+int gpioWaveTxCbPos(void);
+/*D
+This function returns the position of current control block in
+the waveform currently being transmitted.
+
+Returns the CB index or one of the following special values:
+
+-PI_WAVE_NOT_FOUND (-9998) - transmitted wave not found. 
+-PI_NO_TX_WAVE (-9999) - no wave being transmitted.
+D*/
+
+
+/*F*/
 int gpioWaveTxBusy(void);
 /*D
 This function checks to see if a waveform is currently being
