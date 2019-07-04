@@ -3,7 +3,7 @@ pigpio is a Python module for the Raspberry which talks to
 the pigpio daemon to allow control of the general purpose
 input outputs (GPIO).
 
-[http://abyz.co.uk/rpi/pigpio/python.html]
+[http://abyz.me.uk/rpi/pigpio/python.html]
 
 *Features*
 
@@ -168,6 +168,7 @@ Scripts
 
 store_script              Store a script
 run_script                Run a stored script
+update_script             Set a scripts parameters
 script_status             Get script status and parameters
 stop_script               Stop a running script
 delete_script             Delete a stored script
@@ -299,7 +300,7 @@ import threading
 import os
 import atexit
 
-VERSION = "1.36"
+VERSION = "1.42"
 
 exceptions = True
 
@@ -389,6 +390,8 @@ SPI_TX_LSBFIRST = 1 << 14
 SPI_RX_LSBFIRST = 1 << 15
 
 EVENT_BSC = 31
+
+_SOCK_CMD_LEN = 16
 
 # pigpio command numbers
 
@@ -537,6 +540,8 @@ _PI_CMD_BSCX =114
 _PI_CMD_EVM  =115
 _PI_CMD_EVT  =116
 
+_PI_CMD_PROCU=117
+
 # pigpio error numbers
 
 _PI_INIT_FAILED     =-1
@@ -683,6 +688,7 @@ PI_BAD_SCRIPT_NAME  =-140
 PI_BAD_SPI_BAUD     =-141
 PI_NOT_SPI_GPIO     =-142
 PI_BAD_EVENT_ID     =-143
+PI_CMD_INTERRUPTED  =-144
 
 # pigpio error text
 
@@ -712,7 +718,7 @@ _errors=[
    [_PI_BAD_PATHNAME     , "can't open pathname"],
    [PI_NO_HANDLE         , "no handle available"],
    [PI_BAD_HANDLE        , "unknown handle"],
-   [_PI_BAD_IF_FLAGS     , "ifFlags > 3"],
+   [_PI_BAD_IF_FLAGS     , "ifFlags > 4"],
    [_PI_BAD_CHANNEL      , "DMA channel not 0-14"],
    [_PI_BAD_SOCKET_PORT  , "socket port not 1024-30000"],
    [_PI_BAD_FIFO_COMMAND , "unknown fifo command"],
@@ -828,6 +834,7 @@ _errors=[
    [PI_BAD_SPI_BAUD      , "bad SPI baud rate, not 50-500k"],
    [PI_NOT_SPI_GPIO      , "no bit bang SPI in progress on GPIO"],
    [PI_BAD_EVENT_ID      , "bad event id"],
+   [PI_CMD_INTERRUPTED   , "pigpio command interrupted"],
 ]
 
 _except_a = "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%\n{}"
@@ -847,6 +854,10 @@ pigpio.pi() function? E.g. pigpio.pi('soft', 8888)"""
 _except_2 = """
 Do you have permission to access the pigpio daemon?
 Perhaps it was started with sudo pigpiod -nlocalhost"""
+
+_except_3 = """
+Can't create callback thread.
+Perhaps too many simultaneous pigpio connections."""
 
 class _socklock:
    """
@@ -964,22 +975,36 @@ def _u2i(uint32):
          raise error(error_text(v))
    return v
 
-def _pigpio_command(sl, cmd, p1, p2, rl=True):
+def _pigpio_command(sl, cmd, p1, p2):
    """
    Runs a pigpio socket command.
 
     sl:= command socket and lock.
    cmd:= the command to be executed.
     p1:= command parameter 1 (if applicable).
-     p2:=  command parameter 2 (if applicable).
+    p2:= command parameter 2 (if applicable).
    """
-   sl.l.acquire()
-   sl.s.send(struct.pack('IIII', cmd, p1, p2, 0))
-   dummy, res = struct.unpack('12sI', sl.s.recv(16))
-   if rl: sl.l.release()
+   res = PI_CMD_INTERRUPTED
+   with sl.l:
+      sl.s.send(struct.pack('IIII', cmd, p1, p2, 0))
+      dummy, res = struct.unpack('12sI', sl.s.recv(_SOCK_CMD_LEN))
    return res
 
-def _pigpio_command_ext(sl, cmd, p1, p2, p3, extents, rl=True):
+def _pigpio_command_nolock(sl, cmd, p1, p2):
+   """
+   Runs a pigpio socket command.
+
+    sl:= command socket and lock.
+   cmd:= the command to be executed.
+    p1:= command parameter 1 (if applicable).
+    p2:= command parameter 2 (if applicable).
+   """
+   res = PI_CMD_INTERRUPTED
+   sl.s.send(struct.pack('IIII', cmd, p1, p2, 0))
+   dummy, res = struct.unpack('12sI', sl.s.recv(_SOCK_CMD_LEN))
+   return res
+
+def _pigpio_command_ext(sl, cmd, p1, p2, p3, extents):
    """
    Runs an extended pigpio socket command.
 
@@ -996,10 +1021,32 @@ def _pigpio_command_ext(sl, cmd, p1, p2, p3, extents, rl=True):
          ext.extend(_b(x))
       else:
          ext.extend(x)
-   sl.l.acquire()
+   res = PI_CMD_INTERRUPTED
+   with sl.l:
+      sl.s.sendall(ext)
+      dummy, res = struct.unpack('12sI', sl.s.recv(_SOCK_CMD_LEN))
+   return res
+
+def _pigpio_command_ext_nolock(sl, cmd, p1, p2, p3, extents):
+   """
+   Runs an extended pigpio socket command.
+
+        sl:= command socket and lock.
+       cmd:= the command to be executed.
+        p1:= command parameter 1 (if applicable).
+        p2:= command parameter 2 (if applicable).
+        p3:= total size in bytes of following extents
+   extents:= additional data blocks
+   """
+   res = PI_CMD_INTERRUPTED
+   ext = bytearray(struct.pack('IIII', cmd, p1, p2, p3))
+   for x in extents:
+      if type(x) == type(""):
+         ext.extend(_b(x))
+      else:
+         ext.extend(x)
    sl.s.sendall(ext)
-   dummy, res = struct.unpack('12sI', sl.s.recv(16))
-   if rl: sl.l.release()
+   dummy, res = struct.unpack('12sI', sl.s.recv(_SOCK_CMD_LEN))
    return res
 
 class _event_ADT:
@@ -1048,7 +1095,8 @@ class _callback_thread(threading.Thread):
       self.callbacks = []
       self.events = []
       self.sl.s = socket.create_connection((host, port), None)
-      self.handle = _pigpio_command(self.sl, _PI_CMD_NOIB, 0, 0)
+      self.lastLevel = _pigpio_command(self.sl,  _PI_CMD_BR1, 0, 0)
+      self.handle = _u2i(_pigpio_command(self.sl, _PI_CMD_NOIB, 0, 0))
       self.go = True
       self.start()
 
@@ -1101,19 +1149,21 @@ class _callback_thread(threading.Thread):
    def run(self):
       """Runs the notification thread."""
 
-      lastLevel = _pigpio_command(self.control,  _PI_CMD_BR1, 0, 0)
+      lastLevel = self.lastLevel
 
+      RECV_SIZ = 4096
       MSG_SIZ = 12
 
+      buf = bytes()
       while self.go:
 
-         buf = self.sl.s.recv(MSG_SIZ)
+         buf += self.sl.s.recv(RECV_SIZ)
+         offset = 0
 
-         while self.go and len(buf) < MSG_SIZ:
-            buf += self.sl.s.recv(MSG_SIZ-len(buf))
-
-         if self.go:
-            seq, flags, tick, level = (struct.unpack('HHII', buf))
+         while self.go and (len(buf) - offset) >= MSG_SIZ:
+            msgbuf = buf[offset:offset + MSG_SIZ]
+            offset += MSG_SIZ
+            seq, flags, tick, level = (struct.unpack('HHII', msgbuf))
 
             if flags == 0:
                changed = level ^ lastLevel
@@ -1136,6 +1186,7 @@ class _callback_thread(threading.Thread):
                   for cb in self.events:
                      if cb.event == event:
                         cb.func(event, tick)
+         buf = buf[offset:]
 
       self.sl.s.close()
 
@@ -1743,8 +1794,8 @@ class pi():
       The watchdog may be cancelled by setting timeout to 0.
 
       Once a watchdog has been started callbacks for the GPIO
-      will be triggered whenever there has been no GPIO activity
-      for the timeout interval.
+      will be triggered every timeout interval after the last
+      GPIO activity.
 
       The callback will receive the special level TIMEOUT.
 
@@ -2140,8 +2191,8 @@ class pi():
 
       The bytes required for each character depend upon [*bb_bits*].
 
-      For [*bb_bits*] 1-8 there will be one byte per character. 
-      For [*bb_bits*] 9-16 there will be two bytes per character. 
+      For [*bb_bits*] 1-8 there will be one byte per character.
+      For [*bb_bits*] 9-16 there will be two bytes per character.
       For [*bb_bits*] 17-32 there will be four bytes per character.
 
       ...
@@ -2202,8 +2253,8 @@ class pi():
 
       A pulse specifies
 
-      1) the GPIO to be switched on at the start of the pulse. 
-      2) the GPIO to be switched off at the start of the pulse. 
+      1) the GPIO to be switched on at the start of the pulse.
+      2) the GPIO to be switched off at the start of the pulse.
       3) the delay in microseconds before the next pulse.
 
       Any or all the fields can be zero.  It doesn't make any sense
@@ -2225,6 +2276,15 @@ class pi():
       wave_id:= >=0 (as returned by a prior call to [*wave_create*]).
 
       Wave ids are allocated in order, 0, 1, 2, etc.
+
+      The wave is flagged for deletion.  The resources used by the wave
+      will only be reused when either of the following apply.
+
+      - all waves with higher numbered wave ids have been deleted or have
+      been flagged for deletion.
+
+      - a new wave is created which uses exactly the same resources as
+      the current wave (see the C source for gpioWaveCreate for details).
 
       ...
       pi.wave_delete(6) # delete waveform with id 6
@@ -2329,7 +2389,7 @@ class pi():
       Returns the waveform id or one of the following special
       values:
 
-      WAVE_NOT_FOUND (9998) - transmitted wave not found. 
+      WAVE_NOT_FOUND (9998) - transmitted wave not found.
       NO_TX_WAVE (9999) - no wave being transmitted.
 
       ...
@@ -2538,14 +2598,15 @@ class pi():
       i2c_address:= 0-0x7F.
         i2c_flags:= 0, no flags are currently defined.
 
-      Normally you would only use the [*i2c_**] functions if
-      you are or will be connecting to the Pi over a network.  If
-      you will always run on the local Pi use the standard SMBus
-      module instead.
-
       Physically buses 0 and 1 are available on the Pi.  Higher
       numbered buses will be available if a kernel supported bus
       multiplexor is being used.
+
+      The GPIO used are given in the following table.
+
+            @ SDA @ SCL
+      I2C 0 @  0  @  1
+      I2C 1 @  2  @  3
 
       For the SMBus commands the low level transactions are shown
       at the end of the function description.  The following
@@ -2555,7 +2616,7 @@ class pi():
       S     (1 bit) : Start bit
       P     (1 bit) : Stop bit
       Rd/Wr (1 bit) : Read/Write bit. Rd equals 1, Wr equals 0.
-      A, NA (1 bit) : Accept and not accept bit. 
+      A, NA (1 bit) : Accept and not accept bit.
       Addr  (7 bits): I2C 7 bit address.
       reg   (8 bits): Command byte, which often selects a register.
       Data  (8 bits): A data byte.
@@ -2847,14 +2908,14 @@ class pi():
          # process read failure
       ...
       """
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(_pigpio_command(self.sl, _PI_CMD_I2CRK, handle, reg, False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-      else:
-         data = ""
-      self.sl.l.release()
-      return bytes, data
+      bytes = PI_CMD_INTERRUPTED
+      rdata = ""
+      with self.sl.l:
+         bytes = u2i(_pigpio_command_nolock(
+            self.sl, _PI_CMD_I2CRK, handle, reg))
+         if bytes > 0:
+            rdata = self._rxbuf(bytes)
+      return bytes, rdata
 
    def i2c_block_process_call(self, handle, reg, data):
       """
@@ -2897,15 +2958,14 @@ class pi():
       ## extension ##
       # s len data bytes
 
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(_pigpio_command_ext(
-         self.sl, _PI_CMD_I2CPK, handle, reg, len(data), [data], False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-      else:
-         data = ""
-      self.sl.l.release()
-      return bytes, data
+      bytes = PI_CMD_INTERRUPTED
+      rdata = ""
+      with self.sl.l:
+         bytes = u2i(_pigpio_command_ext_nolock(
+            self.sl, _PI_CMD_I2CPK, handle, reg, len(data), [data]))
+         if bytes > 0:
+            rdata = self._rxbuf(bytes)
+      return bytes, rdata
 
    def i2c_write_i2c_block_data(self, handle, reg, data):
       """
@@ -2975,15 +3035,14 @@ class pi():
       # I count
       extents = [struct.pack("I", count)]
 
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(_pigpio_command_ext(
-         self.sl, _PI_CMD_I2CRI, handle, reg, 4, extents, False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-      else:
-         data = ""
-      self.sl.l.release()
-      return bytes, data
+      bytes = PI_CMD_INTERRUPTED
+      rdata = ""
+      with self.sl.l:
+         bytes = u2i(_pigpio_command_ext_nolock(
+            self.sl, _PI_CMD_I2CRI, handle, reg, 4, extents))
+         if bytes > 0:
+            rdata = self._rxbuf(bytes)
+      return bytes, rdata
 
    def i2c_read_device(self, handle, count):
       """
@@ -3006,15 +3065,14 @@ class pi():
       (count, data) = pi.i2c_read_device(h, 12)
       ...
       """
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(
-         _pigpio_command(self.sl, _PI_CMD_I2CRD, handle, count, False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-      else:
-         data = ""
-      self.sl.l.release()
-      return bytes, data
+      bytes = PI_CMD_INTERRUPTED
+      rdata = ""
+      with self.sl.l:
+         bytes = u2i(
+            _pigpio_command_nolock(self.sl, _PI_CMD_I2CRD, handle, count))
+         if bytes > 0:
+            rdata = self._rxbuf(bytes)
+      return bytes, rdata
 
    def i2c_write_device(self, handle, data):
       """
@@ -3108,15 +3166,14 @@ class pi():
       ## extension ##
       # s len data bytes
 
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(_pigpio_command_ext(
-         self.sl, _PI_CMD_I2CZ, handle, 0, len(data), [data], False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-      else:
-         data = ""
-      self.sl.l.release()
-      return bytes, data
+      bytes = PI_CMD_INTERRUPTED
+      rdata = ""
+      with self.sl.l:
+         bytes = u2i(_pigpio_command_ext_nolock(
+            self.sl, _PI_CMD_I2CZ, handle, 0, len(data), [data]))
+         if bytes > 0:
+            rdata = self._rxbuf(bytes)
+      return bytes, rdata
 
 
    def bb_spi_open(self, CS, MISO, MOSI, SCLK, baud=100000, spi_flags=0):
@@ -3130,7 +3187,7 @@ class pi():
           SCLK := 0-31
           baud := 50-250000
       spiFlags := see below
-      
+
       spiFlags consists of the least significant 22 bits.
 
       . .
@@ -3193,7 +3250,7 @@ class pi():
       # I SCLK
       # I baud
       # I spi_flags
-      
+
       extents = [struct.pack("IIIII", MISO, MOSI, SCLK, baud, spi_flags)]
       return _u2i(_pigpio_command_ext(
          self.sl, _PI_CMD_BSPIO, CS, 0, 20, extents))
@@ -3277,15 +3334,14 @@ class pi():
       ## extension ##
       # s len data bytes
 
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(_pigpio_command_ext(
-         self.sl, _PI_CMD_BSPIX, CS, 0, len(data), [data], False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-      else:
-         data = ""
-      self.sl.l.release()
-      return bytes, data
+      bytes = PI_CMD_INTERRUPTED
+      rdata = ""
+      with self.sl.l:
+         bytes = u2i(_pigpio_command_ext_nolock(
+            self.sl, _PI_CMD_BSPIX, CS, 0, len(data), [data]))
+         if bytes > 0:
+            rdata = self._rxbuf(bytes)
+      return bytes, rdata
 
 
    def bb_i2c_open(self, SDA, SCL, baud=100000):
@@ -3296,9 +3352,9 @@ class pi():
       Bit banging I2C allows for certain operations which are not possible
       with the standard I2C driver.
 
-      o baud rates as low as 50 
-      o repeated starts 
-      o clock stretching 
+      o baud rates as low as 50
+      o repeated starts
+      o clock stretching
       o I2C on any pair of spare GPIO
 
        SDA:= 0-31
@@ -3414,15 +3470,14 @@ class pi():
       ## extension ##
       # s len data bytes
 
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(_pigpio_command_ext(
-         self.sl, _PI_CMD_BI2CZ, SDA, 0, len(data), [data], False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-      else:
-         data = ""
-      self.sl.l.release()
-      return bytes, data
+      bytes = PI_CMD_INTERRUPTED
+      rdata = ""
+      with self.sl.l:
+         bytes = u2i(_pigpio_command_ext_nolock(
+            self.sl, _PI_CMD_BI2CZ, SDA, 0, len(data), [data]))
+         if bytes > 0:
+            rdata = self._rxbuf(bytes)
+      return bytes, rdata
 
    def event_trigger(self, event):
       """
@@ -3544,20 +3599,21 @@ class pi():
       ## extension ##
       # s len data bytes
 
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(_pigpio_command_ext(
-         self.sl, _PI_CMD_BSCX, bsc_control, 0, len(data), [data], False))
-      if bytes > 0:
-         rx = self._rxbuf(bytes)
-         status = struct.unpack('I', rx[0:4])[0]
-         bytes -= 4
-         data = rx[4:]
-      else:
-         status = bytes
-         bytes = 0
-         data = bytearray(b'')
-      self.sl.l.release()
-      return status, bytes, data
+      status = PI_CMD_INTERRUPTED
+      bytes = 0
+      rdata = bytearray(b'')
+      with self.sl.l:
+         bytes = u2i(_pigpio_command_ext_nolock(
+            self.sl, _PI_CMD_BSCX, bsc_control, 0, len(data), [data]))
+         if bytes > 0:
+            rx = self._rxbuf(bytes)
+            status = struct.unpack('I', rx[0:4])[0]
+            bytes -= 4
+            rdata = rx[4:]
+         else:
+            status = bytes
+            bytes = 0
+      return status, bytes, rdata
 
    def bsc_i2c(self, i2c_address, data=[]):
       """
@@ -3681,24 +3737,27 @@ class pi():
 
    def spi_open(self, spi_channel, baud, spi_flags=0):
       """
-      Returns a handle for the SPI device on channel.  Data will be
-      transferred at baud bits per second.  The flags may be used to
-      modify the default behaviour of 4-wire operation, mode 0,
-      active low chip select.
+      Returns a handle for the SPI device on the channel.  Data
+      will be transferred at baud bits per second.  The flags
+      may be used to modify the default behaviour of 4-wire
+      operation, mode 0, active low chip select.
 
-      An auxiliary SPI device is available on all models but the
-      A and B and may be selected by setting the A bit in the
-      flags. The auxiliary device has 3 chip selects and a
-      selectable word size in bits.
+      The Pi has two SPI peripherals: main and auxiliary.
 
-      spi_channel:= 0-1 (0-2 for the auxiliary SPI device).
+      The main SPI has two chip selects (channels), the auxiliary
+      has three.
+
+      The auxiliary SPI is available on all models but the A and B.
+
+      The GPIO used are given in the following table.
+
+               @ MISO @ MOSI @ SCLK @ CE0 @ CE1 @ CE2
+      Main SPI @    9 @   10 @   11 @   8 @   7 @   -
+      Aux SPI  @   19 @   20 @   21 @  18 @  17 @  16
+
+      spi_channel:= 0-1 (0-2 for the auxiliary SPI).
              baud:= 32K-125M (values above 30M are unlikely to work).
         spi_flags:= see below.
-
-      Normally you would only use the [*spi_**] functions if
-      you are or will be connecting to the Pi over a network.  If
-      you will always run on the local Pi use the standard SPI
-      module instead.
 
       spi_flags consists of the least significant 22 bits.
 
@@ -3710,7 +3769,7 @@ class pi():
       mm defines the SPI mode.
 
       WARNING: modes 1 and 3 do not appear to work on
-      the auxiliary device.
+      the auxiliary SPI.
 
       . .
       Mode POL PHA
@@ -3725,35 +3784,42 @@ class pi():
       ux is 0 if the CEx GPIO is reserved for SPI (default)
       and 1 otherwise.
 
-      A is 0 for the standard SPI device, 1 for the auxiliary SPI.
+      A is 0 for the main SPI, 1 for the auxiliary SPI.
 
       W is 0 if the device is not 3-wire, 1 if the device is 3-wire.
-      Standard SPI device only.
+      Main SPI only.
 
       nnnn defines the number of bytes (0-15) to write before
       switching the MOSI line to MISO to read data.  This field
-      is ignored if W is not set.  Standard SPI device only.
+      is ignored if W is not set.  Main SPI only.
 
       T is 1 if the least significant bit is transmitted on MOSI
       first, the default (0) shifts the most significant bit out
-      first.  Auxiliary SPI device only.
+      first.  Auxiliary SPI only.
 
       R is 1 if the least significant bit is received on MISO
       first, the default (0) receives the most significant bit
-      first.  Auxiliary SPI device only.
+      first.  Auxiliary SPI only.
 
       bbbbbb defines the word size in bits (0-32).  The default (0)
-      sets 8 bits per word.  Auxiliary SPI device only.
+      sets 8 bits per word.  Auxiliary SPI only.
 
       The [*spi_read*], [*spi_write*], and [*spi_xfer*] functions
       transfer data packed into 1, 2, or 4 bytes according to
       the word size in bits.
 
-      For bits 1-8 there will be one byte per character. 
-      For bits 9-16 there will be two bytes per character. 
+      For bits 1-8 there will be one byte per character.
+      For bits 9-16 there will be two bytes per character.
       For bits 17-32 there will be four bytes per character.
 
-      E.g. 32 12-bit words will be transferred in 64 bytes.
+      Multi-byte transfers are made in least significant byte
+      first order.
+
+      E.g. to transfer 32 11-bit words data should
+      contain 64 bytes.
+
+      E.g. to transfer the 14 bit value 0x1ABC send the
+      bytes 0xBC followed by 0x1A.
 
       The other bits in flags should be set to zero.
 
@@ -3804,15 +3870,14 @@ class pi():
          # error path
       ...
       """
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(_pigpio_command(
-         self.sl, _PI_CMD_SPIR, handle, count, False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-      else:
-         data = ""
-      self.sl.l.release()
-      return bytes, data
+      bytes = PI_CMD_INTERRUPTED
+      rdata = ""
+      with self.sl.l:
+         bytes = u2i(_pigpio_command_nolock(
+            self.sl, _PI_CMD_SPIR, handle, count))
+         if bytes > 0:
+            rdata = self._rxbuf(bytes)
+      return bytes, rdata
 
    def spi_write(self, handle, data):
       """
@@ -3868,15 +3933,14 @@ class pi():
       ## extension ##
       # s len data bytes
 
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(_pigpio_command_ext(
-         self.sl, _PI_CMD_SPIX, handle, 0, len(data), [data], False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-      else:
-         data = ""
-      self.sl.l.release()
-      return bytes, data
+      bytes = PI_CMD_INTERRUPTED
+      rdata = ""
+      with self.sl.l:
+         bytes = u2i(_pigpio_command_ext_nolock(
+            self.sl, _PI_CMD_SPIX, handle, 0, len(data), [data]))
+         if bytes > 0:
+            rdata = self._rxbuf(bytes)
+      return bytes, rdata
 
    def serial_open(self, tty, baud, ser_flags=0):
       """
@@ -3974,15 +4038,14 @@ class pi():
          # process read data
       ...
       """
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(
-         _pigpio_command(self.sl, _PI_CMD_SERR, handle, count, False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-      else:
-         data = ""
-      self.sl.l.release()
-      return bytes, data
+      bytes = PI_CMD_INTERRUPTED
+      rdata = ""
+      with self.sl.l:
+         bytes = u2i(
+            _pigpio_command_nolock(self.sl, _PI_CMD_SERR, handle, count))
+         if bytes > 0:
+            rdata = self._rxbuf(bytes)
+      return bytes, rdata
 
    def serial_write(self, handle, data):
       """
@@ -4064,7 +4127,13 @@ class pi():
 
       Returns 0 if OK, otherwise PI_BAD_USER_GPIO, or PI_BAD_FILTER.
 
-      Note, each (stable) edge will be timestamped [*steady*]
+      This filter affects the GPIO samples returned to callbacks set up
+      with [*callback*] and [*wait_for_edge*].
+
+      It does not affect levels read by [*read*],
+      [*read_bank_1*], or [*read_bank_2*].
+
+      Each (stable) edge will be timestamped [*steady*]
       microseconds after it was first detected.
 
       ...
@@ -4088,7 +4157,13 @@ class pi():
 
       Returns 0 if OK, otherwise PI_BAD_USER_GPIO, or PI_BAD_FILTER.
 
-      Note, level changes before and after the active period may
+      This filter affects the GPIO samples returned to callbacks set up
+      with [*callback*] and [*wait_for_edge*].
+
+      It does not affect levels read by [*read*],
+      [*read_bank_1*], or [*read_bank_2*].
+
+      Level changes before and after the active period may
       be reported.  Your software must be designed to cope with
       such reports.
 
@@ -4111,7 +4186,7 @@ class pi():
       """
       Store a script for later execution.
 
-      See [[http://abyz.co.uk/rpi/pigpio/pigs.html#Scripts]] for
+      See [[http://abyz.me.uk/rpi/pigpio/pigs.html#Scripts]] for
       details.
 
       script:= the script text as a series of bytes.
@@ -4166,6 +4241,38 @@ class pi():
       return _u2i(_pigpio_command_ext(
          self.sl, _PI_CMD_PROCR, script_id, 0, nump*4, extents))
 
+   def update_script(self, script_id, params=None):
+      """
+      Sets the parameters of a script.  The script may or
+      may not be running.  The first parameters of the script are
+      overwritten with the new values.
+
+      script_id:= id of stored script.
+         params:= up to 10 parameters required by the script.
+
+      ...
+      s = pi.update_script(sid, [par1, par2])
+
+      s = pi.update_script(sid, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+      ...
+      """
+      # I p1 script id
+      # I p2 0
+      # I p3 params * 4 (0-10 params)
+      ## (optional) extension ##
+      # I[] params
+      if params is not None:
+         ext = bytearray()
+         for p in params:
+            ext.extend(struct.pack("I", p))
+         nump = len(params)
+         extents = [ext]
+      else:
+         nump = 0
+         extents = []
+      return _u2i(_pigpio_command_ext(
+         self.sl, _PI_CMD_PROCU, script_id, 0, nump*4, extents))
+
    def script_status(self, script_id):
       """
       Returns the run status of a stored script as well as the
@@ -4191,18 +4298,18 @@ class pi():
       (s, pars) = pi.script_status(sid)
       ...
       """
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(
-         _pigpio_command(self.sl, _PI_CMD_PROCP, script_id, 0, False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-         pars = struct.unpack('11i', _str(data))
-         status = pars[0]
-         params = pars[1:]
-      else:
-         status = bytes
-         params = ()
-      self.sl.l.release()
+      status = PI_CMD_INTERRUPTED
+      params = ()
+      with self.sl.l:
+         bytes = u2i(
+            _pigpio_command_nolock(self.sl, _PI_CMD_PROCP, script_id, 0))
+         if bytes > 0:
+            data = self._rxbuf(bytes)
+            pars = struct.unpack('11i', _str(data))
+            status = pars[0]
+            params = pars[1:]
+         else:
+            status = bytes
       return status, params
 
    def stop_script(self, script_id):
@@ -4274,25 +4381,24 @@ class pi():
       data bits [*bb_bits*] specified in the [*bb_serial_read_open*]
       command.
 
-      For [*bb_bits*] 1-8 there will be one byte per character. 
-      For [*bb_bits*] 9-16 there will be two bytes per character. 
+      For [*bb_bits*] 1-8 there will be one byte per character.
+      For [*bb_bits*] 9-16 there will be two bytes per character.
       For [*bb_bits*] 17-32 there will be four bytes per character.
 
       ...
       (count, data) = pi.bb_serial_read(4)
       ...
       """
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(
-         _pigpio_command(self.sl, _PI_CMD_SLR, user_gpio, 10000, False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-      else:
-         data = ""
-      self.sl.l.release()
-      return bytes, data
+      bytes = PI_CMD_INTERRUPTED
+      rdata = ""
+      with self.sl.l:
+          bytes = u2i(
+             _pigpio_command_nolock(self.sl, _PI_CMD_SLR, user_gpio, 10000))
+          if bytes > 0:
+             rdata = self._rxbuf(bytes)
+      return bytes, rdata
 
-   
+
    def bb_serial_read_close(self, user_gpio):
       """
       Closes a GPIO for bit bang reading of serial data.
@@ -4384,15 +4490,14 @@ class pi():
       ## extension ##
       # s len argx bytes
 
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(_pigpio_command_ext(
-         self.sl, _PI_CMD_CF2, arg1, retMax, len(argx), [argx], False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-      else:
-         data = ""
-      self.sl.l.release()
-      return bytes, data
+      bytes = PI_CMD_INTERRUPTED
+      rdata = ""
+      with self.sl.l:
+         bytes = u2i(_pigpio_command_ext_nolock(
+            self.sl, _PI_CMD_CF2, arg1, retMax, len(argx), [argx]))
+         if bytes > 0:
+            rdata = self._rxbuf(bytes)
+      return bytes, rdata
 
    def get_pad_strength(self, pad):
       """
@@ -4442,8 +4547,9 @@ class pi():
       file_name:= the file to open.
       file_mode:= the file open mode.
 
-      Returns a handle (>=0) if OK, otherwise PI_NO_HANDLE, PI_NO_FILE_ACCESS,
-      PI_BAD_FILE_MODE, PI_FILE_OPEN_FAILED, or PI_FILE_IS_A_DIR.
+      Returns a handle (>=0) if OK, otherwise PI_NO_HANDLE,
+      PI_NO_FILE_ACCESS, PI_BAD_FILE_MODE,
+      PI_FILE_OPEN_FAILED, or PI_FILE_IS_A_DIR.
 
       ...
       h = pi.file_open("/home/pi/shared/dir_3/file.txt",
@@ -4456,9 +4562,9 @@ class pi():
 
       File
 
-      A file may only be opened if permission is granted by an entry in
-      /opt/pigpio/access.  This is intended to allow remote access to files
-      in a more or less controlled manner.
+      A file may only be opened if permission is granted by an entry
+      in /opt/pigpio/access.  This is intended to allow remote access
+      to files in a more or less controlled manner.
 
       Each entry in /opt/pigpio/access takes the form of a file path
       which may contain wildcards followed by a single letter permission.
@@ -4583,15 +4689,14 @@ class pi():
          # process read data
       ...
       """
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(
-         _pigpio_command(self.sl, _PI_CMD_FR, handle, count, False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-      else:
-         data = ""
-      self.sl.l.release()
-      return bytes, data
+      bytes = PI_CMD_INTERRUPTED
+      rdata = ""
+      with self.sl.l:
+         bytes = u2i(
+            _pigpio_command_nolock(self.sl, _PI_CMD_FR, handle, count))
+         if bytes > 0:
+            rdata = self._rxbuf(bytes)
+      return bytes, rdata
 
    def file_write(self, handle, data):
       """
@@ -4689,15 +4794,14 @@ class pi():
       ## extension ##
       # s len data bytes
 
-      # Don't raise exception.  Must release lock.
-      bytes = u2i(_pigpio_command_ext(
-         self.sl, _PI_CMD_FL, 60000, 0, len(fpattern), [fpattern], False))
-      if bytes > 0:
-         data = self._rxbuf(bytes)
-      else:
-         data = ""
-      self.sl.l.release()
-      return bytes, data
+      bytes = PI_CMD_INTERRUPTED
+      rdata = ""
+      with self.sl.l:
+         bytes = u2i(_pigpio_command_ext_nolock(
+            self.sl, _PI_CMD_FL, 60000, 0, len(fpattern), [fpattern]))
+         if bytes > 0:
+            rdata = self._rxbuf(bytes)
+      return bytes, rdata
 
    def shell(self, shellscr, pstring=""):
       """
@@ -4760,6 +4864,20 @@ class pi():
 
       The user supplied callback receives three parameters, the GPIO,
       the level, and the tick.
+
+      . .
+      Parameter   Value    Meaning
+
+      GPIO        0-31     The GPIO which has changed state
+
+      level       0-2      0 = change to low (a falling edge)
+                           1 = change to high (a rising edge)
+                           2 = no level change (a watchdog timeout)
+
+      tick        32 bit   The number of microseconds since boot
+                           WARNING: this wraps around from
+                           4294967295 to 0 roughly every 72 minutes
+      . .
 
       If a user callback is not specified a default tally callback is
       provided which simply counts edges.  The count may be retrieved
@@ -4889,14 +5007,15 @@ class pi():
 
    def __init__(self,
                 host = os.getenv("PIGPIO_ADDR", 'localhost'),
-                port = os.getenv("PIGPIO_PORT", 8888)):
+                port = os.getenv("PIGPIO_PORT", 8888),
+                show_errors = True):
       """
       Grants access to a Pi's GPIO.
 
       host:= the host name of the Pi on which the pigpio daemon is
              running.  The default is localhost unless overridden by
              the PIGPIO_ADDR environment variable.
-       
+
       port:= the port number on which the pigpio daemon is listening.
              The default is 8888 unless overridden by the PIGPIO_PORT
              environment variable.  The pigpio daemon must have been
@@ -4946,6 +5065,10 @@ class pi():
       except struct.error:
          exception = 2
 
+      except error:
+         # assumed to be no handle available
+         exception = 3
+
       else:
          exception = 0
          atexit.register(self.stop)
@@ -4957,14 +5080,22 @@ class pi():
          if self.sl.s is not None:
             self.sl.s = None
 
-         s = "Can't connect to pigpio at {}({})".format(host, str(port))
+         if show_errors:
 
-         print(_except_a.format(s))
-         if exception == 1:
-             print(_except_1)
-         else:
-             print(_except_2)
-         print(_except_z)
+            s = "Can't connect to pigpio at {}({})".format(host, str(port))
+
+
+            print(_except_a.format(s))
+            if exception == 1:
+                print(_except_1)
+            elif exception == 2:
+                print(_except_2)
+            else:
+                print(_except_3)
+            print(_except_z)
+
+   def __repr__(self):
+      return "<pipio.pi host={} port={}>".format(self._host, self._port)
 
    def stop(self):
       """Release pigpio resources.
@@ -5077,8 +5208,8 @@ def xref():
    edge: 0-2
 
    . .
-   EITHER_EDGE = 2 
-   FALLING_EDGE = 1 
+   EITHER_EDGE = 2
+   FALLING_EDGE = 1
    RISING_EDGE = 0
    . .
 
@@ -5197,7 +5328,8 @@ def xref():
    PI_BAD_SCRIPT_NAME = -140
    PI_BAD_SPI_BAUD = -141
    PI_NOT_SPI_GPIO = -142
-   PI_BAD_EVENT_ID = -143 
+   PI_BAD_EVENT_ID = -143
+   PI_CMD_INTERRUPTED = -144
    . .
 
    event:0-31
@@ -5280,17 +5412,14 @@ def xref():
    handle: >=0
    A number referencing an object opened by one of the following
 
-   [*file_open*] 
-   [*i2c_open*] 
-   [*notify_open*] 
-   [*serial_open*] 
+   [*file_open*]
+   [*i2c_open*]
+   [*notify_open*]
+   [*serial_open*]
    [*spi_open*]
 
    host:
    The name or IP address of the Pi running the pigpio daemon.
-
-   i2c_*:
-   One of the i2c_ functions.
 
    i2c_address: 0-0x7F
    The address of a device on the I2C bus.
@@ -5308,12 +5437,12 @@ def xref():
    level: 0-1 (2)
 
    . .
-   CLEAR = 0 
-   HIGH = 1 
-   LOW = 0 
-   OFF = 0 
-   ON = 1 
-   SET = 1 
+   CLEAR = 0
+   HIGH = 1
+   LOW = 0
+   OFF = 0
+   ON = 1
+   SET = 1
    TIMEOUT = 2 # only returned for a watchdog timeout
    . .
 
@@ -5325,22 +5454,22 @@ def xref():
    1.The operational mode of a GPIO, normally INPUT or OUTPUT.
 
    . .
-   ALT0 = 4 
-   ALT1 = 5 
-   ALT2 = 6 
-   ALT3 = 7 
-   ALT4 = 3 
-   ALT5 = 2 
-   INPUT = 0 
+   ALT0 = 4
+   ALT1 = 5
+   ALT2 = 6
+   ALT3 = 7
+   ALT4 = 3
+   ALT5 = 2
+   INPUT = 0
    OUTPUT = 1
    . .
 
    2. The mode of waveform transmission.
 
    . .
-   WAVE_MODE_ONE_SHOT = 0 
-   WAVE_MODE_REPEAT = 1 
-   WAVE_MODE_ONE_SHOT_SYNC = 2 
+   WAVE_MODE_ONE_SHOT = 0
+   WAVE_MODE_REPEAT = 1
+   WAVE_MODE_ONE_SHOT_SYNC = 2
    WAVE_MODE_REPEAT_SYNC = 3
    . .
 
@@ -5367,7 +5496,7 @@ def xref():
    When scripts are started they can receive up to 10 parameters
    to define their operation.
 
-   port: 
+   port:
    The port used by the pigpio daemon, defaults to 8888.
 
    pstring:
@@ -5375,9 +5504,9 @@ def xref():
 
    pud: 0-2
    . .
-   PUD_DOWN = 1 
-   PUD_OFF = 0 
-   PUD_UP = 2 
+   PUD_DOWN = 1
+   PUD_OFF = 0
+   PUD_UP = 2
    . .
 
    pulse_len: 1-100
@@ -5428,9 +5557,9 @@ def xref():
    Direction to seek for [*file_seek*].
 
    . .
-   FROM_START=0 
-   FROM_CURRENT=1 
-   FROM_END=2 
+   FROM_START=0
+   FROM_CURRENT=1
+   FROM_END=2
    . .
 
    seek_offset:
@@ -5447,8 +5576,10 @@ def xref():
    The name of a shell script.  The script must exist
    in /opt/pigpio/cgi and must be executable.
 
-   spi_*:
-   One of the spi_ functions.
+   show_errors:
+   Controls the display of pigpio daemon connection failures.
+   The default of True prints the probable failure reasons to
+   standard output.
 
    spi_channel: 0-2
    A SPI channel.
@@ -5491,8 +5622,8 @@ def xref():
    wave_add_*:
    One of the following
 
-   [*wave_add_new*] 
-   [*wave_add_generic*] 
+   [*wave_add_new*]
+   [*wave_add_generic*]
    [*wave_add_serial*]
 
    wave_id: >=0
@@ -5501,7 +5632,7 @@ def xref():
    wave_send_*:
    One of the following
 
-   [*wave_send_once*] 
+   [*wave_send_once*]
    [*wave_send_repeat*]
 
    wdog_timeout: 0-60000

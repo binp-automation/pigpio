@@ -26,7 +26,7 @@ For more information, please refer to <http://unlicense.org/>
 */
 
 /*
-This version is for pigpio version 57+
+This version is for pigpio version 67+
 */
 
 #include <stdio.h>
@@ -34,6 +34,7 @@ This version is for pigpio version 57+
 #include <stdarg.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <inttypes.h>
 
 #include "pigpio.h"
 #include "command.h"
@@ -148,6 +149,7 @@ cmdInfo_t cmdInfo[]=
    {PI_CMD_PROCP, "PROCP", 112, 7}, // gpioScriptStatus
    {PI_CMD_PROCR, "PROCR", 191, 0}, // gpioRunScript
    {PI_CMD_PROCS, "PROCS", 112, 0}, // gpioStopScript
+   {PI_CMD_PROCU, "PROCU", 191, 0}, // gpioUpdateScript
 
    {PI_CMD_PRRG,  "PRRG",  112, 2}, // gpioGetPWMrealRange
    {PI_CMD_PRS,   "PRS",   121, 2}, // gpioSetPWMrange
@@ -347,6 +349,7 @@ PROCD sid        Delete script\n\
 PROCP sid        Get script status and parameters\n\
 PROCR sid ...    Run script\n\
 PROCS sid        Stop script\n\
+PROCU sid ...    Set script parameters\n\
 PRRG g           Get GPIO PWM real range\n\
 PRS g v          Set GPIO PWM range\n\
 PUD g pud        Set GPIO pull up/down\n\
@@ -442,7 +445,7 @@ static errInfo_t errInfo[]=
    {PI_BAD_PATHNAME     , "can't open pathname"},
    {PI_NO_HANDLE        , "no handle available"},
    {PI_BAD_HANDLE       , "unknown handle"},
-   {PI_BAD_IF_FLAGS     , "ifFlags > 3"},
+   {PI_BAD_IF_FLAGS     , "ifFlags > 4"},
    {PI_BAD_CHANNEL      , "DMA channel not 0-14"},
    {PI_BAD_SOCKET_PORT  , "socket port not 1024-30000"},
    {PI_BAD_FIFO_COMMAND , "unknown fifo command"},
@@ -560,6 +563,7 @@ static errInfo_t errInfo[]=
    {PI_BAD_SPI_BAUD     , "bad SPI baud rate, not 50-500k"},
    {PI_NOT_SPI_GPIO     , "no bit bang SPI in progress on GPIO"},
    {PI_BAD_EVENT_ID     , "bad event id"},
+   {PI_CMD_INTERRUPTED  , "command interrupted, Python"},
 
 };
 
@@ -577,7 +581,7 @@ static int cmdMatch(char *str)
    return CMD_UNKNOWN_CMD;
 }
 
-static int getNum(char *str, uint32_t *val, int8_t *opt)
+static int getNum(char *str, uintptr_t *val, int8_t *opt)
 {
    int f, n;
    intmax_t v;
@@ -624,13 +628,13 @@ char *cmdStr(void)
 }
 
 int cmdParse(
-   char *buf, uint32_t *p, unsigned ext_len, char *ext, cmdCtlParse_t *ctl)
+   char *buf, uintptr_t *p, unsigned ext_len, char *ext, cmdCtlParse_t *ctl)
 {
    int f, valid, idx, val, pp, pars, n, n2;
    char *p8;
    int32_t *p32;
    char c;
-   uint32_t tp1=0, tp2=0, tp3=0, tp4=0, tp5=0;
+   uintptr_t tp1=0, tp2=0, tp3=0, tp4=0, tp5=0;
    int8_t to1, to2, to3, to4, to5;
    int eaten;
 
@@ -890,11 +894,11 @@ int cmdParse(
                 */
          ctl->eaten += getNum(buf+ctl->eaten, &p[1], &ctl->opt[1]);
          ctl->eaten += getNum(buf+ctl->eaten, &p[2], &ctl->opt[2]);
-         ctl->eaten += getNum(buf+ctl->eaten, &tp1, &to1);
+         ctl->eaten += getNum(buf+ctl->eaten, &tp1, &ctl->opt[3]);
 
          if ((ctl->opt[1] > 0) && ((int)p[1] >= 0) &&
              (ctl->opt[2] > 0) && ((int)p[2] >= 0) &&
-             (to1 == CMD_NUMERIC) && ((int)tp1 >= 0))
+             (ctl->opt[3] > 0) && ((int)tp1 >= 0))
          {
             p[3] = 4;
             memcpy(ext, &tp1, 4);
@@ -975,7 +979,7 @@ int cmdParse(
 
          break;
 
-      case 191: /* PROCR
+      case 191: /* PROCR PROCU
 
                    One to 11 parameters, first positive,
                    optional remainder, any value.
@@ -1257,7 +1261,7 @@ int cmdParseScript(char *script, cmdScript_t *s, int diags)
 {
    int idx, len, b, i, j, tags, resolved;
    int status;
-   uint32_t p[10];
+   uintptr_t p[10];
    cmdInstr_t instr;
    cmdCtlParse_t ctl;
    char v[CMD_MAX_EXTENSION];
@@ -1321,7 +1325,7 @@ int cmdParseScript(char *script, cmdScript_t *s, int diags)
                   {
                      if (diags)
                      {
-                        fprintf(stderr, "Duplicate tag: %d\n", instr.p[1]);
+                        fprintf(stderr, "Duplicate tag: %"PRIdPTR"\n", instr.p[1]);
                      }
 
                      if (!status) status = PI_DUP_TAG;
@@ -1337,7 +1341,7 @@ int cmdParseScript(char *script, cmdScript_t *s, int diags)
             {
                if (diags)
                {
-                  fprintf(stderr, "Too many tags: %d\n", instr.p[1]);
+                  fprintf(stderr, "Too many tags: %"PRIdPTR"\n", instr.p[1]);
                }
                if (!status) status = PI_TOO_MANY_TAGS;
                idx = -1;
@@ -1392,7 +1396,7 @@ int cmdParseScript(char *script, cmdScript_t *s, int diags)
          {
             if (diags)
             {
-               fprintf(stderr, "Can't resolve tag %d\n", instr.p[1]);
+               fprintf(stderr, "Can't resolve tag %"PRIdPTR"\n", instr.p[1]);
             }
             if (!status) status = PI_BAD_TAG;
          }
